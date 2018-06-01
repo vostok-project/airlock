@@ -1,7 +1,11 @@
 package ru.kontur.airlock;
 
 import com.codahale.metrics.JmxReporter;
+import com.codahale.metrics.MetricFilter;
 import com.codahale.metrics.MetricRegistry;
+import com.codahale.metrics.MetricRegistryListener;
+import com.codahale.metrics.graphite.Graphite;
+import com.codahale.metrics.graphite.GraphiteReporter;
 import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
@@ -9,10 +13,12 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.net.InetSocketAddress;
 import java.nio.file.Paths;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.TimeUnit;
 import org.rapidoid.log.Log;
 import org.rapidoid.net.Server;
 
@@ -27,19 +33,22 @@ public class Application {
             Log.info("Starting application");
 
             org.apache.log4j.PropertyConfigurator.configure(getProperties("log4j.properties"));
-            org.apache.log4j.BasicConfigurator.configure();
 
-            JmxReporter.forRegistry(metricRegistry).build().start();
+            //JmxReporter.forRegistry(metricRegistry).build().start();
 
             Properties producerProps = getProperties("producer.properties");
             Properties appProperties = getProperties("app.properties");
+            Properties bandwidthWeights = getProperties("apikeysBandwidthWeights.properties");
+
+            startGraphiteReporter(appProperties);
+
             int port = Integer.parseInt(appProperties.getProperty("port", "6306"));
             boolean useInternalMeter =
                     Integer.parseInt(appProperties.getProperty("useInternalMeter", "0")) > 0;
 
             eventSender = new EventSender(producerProps);
-            httpServer = new HttpServer(eventSender, getValidatorFactory(), useInternalMeter)
-                    .listen(port);
+            httpServer = new HttpServer(eventSender, getValidatorFactory(), useInternalMeter,
+                    appProperties, bandwidthWeights).listen(port);
 
             Log.info("Application started");
         } catch (Exception ex) {
@@ -48,6 +57,30 @@ public class Application {
 
         Runtime.getRuntime().addShutdownHook(new Thread(Application::shutdown));
         new BufferedReader(new InputStreamReader(System.in)).readLine();
+    }
+
+    private static void startGraphiteReporter(Properties appProperties) {
+        final String graphiteUrl = appProperties.getProperty("graphiteUrl", "graphite:2003");
+        final String[] splittedGraphiteUrl = graphiteUrl.split(":");
+        if (splittedGraphiteUrl.length < 2) {
+            Log.error("invalid graphite url " + graphiteUrl);
+        } else {
+            final int graphitePort = Integer.parseInt(splittedGraphiteUrl[1]);
+            final InetSocketAddress address = new InetSocketAddress(splittedGraphiteUrl[0], graphitePort);
+            final Graphite graphite = new Graphite(address);
+            final String graphitePrefix = appProperties
+                    .getProperty("graphitePrefix", "vostok.test.airlock");
+            final GraphiteReporter reporter = GraphiteReporter.forRegistry(metricRegistry)
+                    .prefixedWith(graphitePrefix)
+                    //.convertRatesTo(TimeUnit.SECONDS)
+                    //.convertDurationsTo(TimeUnit.MILLISECONDS)
+                    //.filter(MetricFilter.ALL)
+                    .build(graphite);
+            final int graphiteRetentionSeconds = Integer.parseInt(appProperties
+                    .getProperty("graphiteRetentionSeconds", "60"));
+            reporter.start(graphiteRetentionSeconds, TimeUnit.SECONDS);
+            Log.info("Started graphite reporter at " + address.toString() + " with prefix '" + graphitePrefix + "'");
+        }
     }
 
     private static void shutdown() {

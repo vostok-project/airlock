@@ -2,10 +2,24 @@ package ru.kontur.airlock;
 
 import static com.codahale.metrics.MetricRegistry.name;
 
+import com.codahale.metrics.Clock;
+import com.codahale.metrics.Histogram;
 import com.codahale.metrics.Meter;
-import com.codahale.metrics.Timer;
+import com.codahale.metrics.SlidingTimeWindowArrayReservoir;
+import com.codahale.metrics.SlidingTimeWindowReservoir;
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
+import com.google.common.cache.RemovalListener;
+import com.google.common.util.concurrent.RateLimiter;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Properties;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import javax.naming.SizeLimitExceededException;
 import org.rapidoid.buffer.Buf;
 import org.rapidoid.data.BufRange;
 import org.rapidoid.http.AbstractHttpServer;
@@ -17,7 +31,6 @@ import org.rapidoid.net.impl.RapidoidHelper;
 import ru.kontur.airlock.dto.AirlockMessage;
 import ru.kontur.airlock.dto.BinarySerializable;
 import ru.kontur.airlock.dto.EventGroup;
-
 
 public class HttpServer extends AbstractHttpServer {
 
@@ -33,19 +46,55 @@ public class HttpServer extends AbstractHttpServer {
     private final EventSender eventSender;
     private final ValidatorFactory validatorFactory;
     private final Meter requestSizeMeter = Application.metricRegistry
-            .meter(name(HttpServer.class, "request-size"));
+            .meter(name( "request-size"));
     private final Meter eventMeter = Application.metricRegistry
-            .meter(name(HttpServer.class, "events", "total"));
-    private final Timer requests = Application.metricRegistry
-            .timer(name(HttpServer.class, "requests"));
+            .meter(name( "events", "total"));
+    private final Histogram requests;
     private final MetricsReporter metricsReporter;
+    private final Cache<String, RateInfo> rateInfoCache;
+    private final long bandwidthBytes;
+    private final Map<String, Double> bandwidthWeights;
+    private final RateLimiter bandwidthRateLimiter;
+
+    class RateInfo {
+        public RateLimiter rateLimiter;
+        public double weight;
+
+        public RateInfo(RateLimiter rateLimiter, double weight) {
+            this.rateLimiter = rateLimiter;
+            this.weight = weight;
+        }
+    }
 
     public HttpServer(EventSender eventSender, ValidatorFactory validatorFactory,
-            boolean useInternalMeter) throws IOException {
+            boolean useInternalMeter, Properties appProperties,
+            Properties bandwidthWeights) throws IOException {
         this.eventSender = eventSender;
         this.validatorFactory = validatorFactory;
+        final int graphiteRetentionSeconds = Integer.parseInt(appProperties
+                .getProperty("graphiteRetentionSeconds", "60"));
+        requests = Application.metricRegistry
+                //.histogram(name("requests"), () -> new Histogram(new AutoResettableUniformReservoir()));
+                .histogram(name("requests"), () -> new Histogram(new SlidingTimeWindowReservoir(graphiteRetentionSeconds,TimeUnit.SECONDS)));
         metricsReporter =
                 useInternalMeter ? new MetricsReporter(3, eventMeter, requestSizeMeter) : null;
+        bandwidthBytes = Math.round(Double
+                .parseDouble(appProperties.getProperty("bandwidthMb", "1000"))*1024*1024);
+        final long rateInfoExpirationSeconds = Long
+                .parseLong(appProperties.getProperty("rateInfoExpirationSeconds", "600"));
+        this.bandwidthWeights = new HashMap<>();
+        for (final String name: bandwidthWeights.stringPropertyNames())
+            this.bandwidthWeights.put(name, Double.parseDouble(bandwidthWeights.getProperty(name)));
+
+        int rateLimiterCacheSize = Integer
+                .parseInt(appProperties.getProperty("rateLimiterCacheSize", "10000"));
+
+        rateInfoCache = CacheBuilder.newBuilder()
+                .maximumSize(rateLimiterCacheSize)
+                .expireAfterAccess(rateInfoExpirationSeconds, TimeUnit.SECONDS)
+                .removalListener((RemovalListener<String, RateInfo>) removal -> updateRateLimits())
+                .build();
+        bandwidthRateLimiter = RateLimiter.create(bandwidthBytes);
     }
 
     @Override
@@ -93,7 +142,8 @@ public class HttpServer extends AbstractHttpServer {
     }
 
     private HttpStatus send(Channel ctx, Buf buf, RapidoidHelper req, boolean isKeepAlive) {
-        final Timer.Context timerContext = requests.time();
+        final Clock clock = Clock.defaultClock();
+        long startTime = clock.getTick();
         try {
             String apiKey = getHeader(buf, req, "x-apikey");
             if (apiKey == null || apiKey.trim().isEmpty()) {
@@ -106,15 +156,21 @@ public class HttpServer extends AbstractHttpServer {
                 getErrorMeter("empty-body").mark();
                 return error(ctx, isKeepAlive, "Request body is empty", 400, apiKey);
             }
-            byte[] body = new byte[req.body.length];
-            buf.get(req.body, body, 0);
+            final int bodyLength = req.body.length;
+            try {
+                checkLimits(apiKey, bodyLength);
+            } catch (SizeLimitExceededException e) {
+                return error(ctx, isKeepAlive, e.getMessage(), 429, apiKey);
+            }
 
+            byte[] body = new byte[bodyLength];
+            buf.get(req.body, body, 0);
             AirlockMessage message;
             try {
                 message = BinarySerializable.fromByteArray(body, AirlockMessage.class);
             } catch (IOException e) {
                 getErrorMeter("deserialization").mark();
-                return error(ctx, isKeepAlive, e.getMessage(), 400, apiKey);
+                return error(ctx, isKeepAlive, e.toString(), 400, apiKey);
             }
 
             Validator validator = validatorFactory.getValidator(apiKey);
@@ -140,7 +196,7 @@ public class HttpServer extends AbstractHttpServer {
                 getRoutingKeyMeter(eventGroup.eventRoutingKey).mark(groupSize);
             }
             eventMeter.mark(eventCount);
-            requestSizeMeter.mark(req.body.length);
+            requestSizeMeter.mark(bodyLength);
 
             if (validEventGroups.size() < message.eventGroups.size()) {
                 getErrorMeter("filtered-partial").mark();
@@ -151,17 +207,57 @@ public class HttpServer extends AbstractHttpServer {
                 return ok(ctx, isKeepAlive, new byte[0], MediaType.TEXT_PLAIN);
             }
         } finally {
-            timerContext.stop();
+            long elapsed = clock.getTick() - startTime;
+            requests.update(elapsed);
+        }
+    }
+
+    private void checkLimits(String apiKey, int bodyLength) throws SizeLimitExceededException {
+        final RateInfo rateInfo;
+        try {
+            double weight = bandwidthWeights.getOrDefault(apiKey, 1D);
+            final boolean[] addedRateInfo = {false}; //see https://stackoverflow.com/questions/34865383/variable-used-in-lambda-expression-should-be-final-or-effectively-final
+            rateInfo = rateInfoCache
+                    .get(apiKey, () -> {
+                        addedRateInfo[0] = true;
+                        return new RateInfo(RateLimiter.create(bandwidthBytes), weight);
+                    });
+            if (addedRateInfo[0]) {
+                updateRateLimits();
+            }
+            final boolean apikeyAcquireResult = rateInfo.rateLimiter.tryAcquire(bodyLength);
+            if (!bandwidthRateLimiter.tryAcquire(bodyLength) && !apikeyAcquireResult) {
+                getErrorMeter("too-much-traffic").mark();
+                throw new SizeLimitExceededException("too much traffic per apikey, max rate="+rateInfo.rateLimiter.getRate());
+            }
+        } catch (ExecutionException e) {
+            getErrorMeter("ratelimiter").mark();
+            Log.warn(e.toString() + ", apikey=" + apiKey);
+        }
+    }
+
+    private void updateRateLimits() {
+        double weightSum = 0;
+        final Collection<RateInfo> rateInfos = rateInfoCache.asMap().values();
+        for (RateInfo curInfo : rateInfos) {
+            weightSum += curInfo.weight;
+        }
+        for (RateInfo curInfo : rateInfos) {
+            if (weightSum <= 0) {
+                curInfo.rateLimiter.setRate(1D / rateInfos.size() * bandwidthBytes);
+            } else {
+                curInfo.rateLimiter.setRate(curInfo.weight / weightSum * bandwidthBytes);
+            }
         }
     }
 
     private Meter getRoutingKeyMeter(String routingKey) {
         return Application.metricRegistry
-                .meter(name(HttpServer.class, "events", routingKey.replace('.', '-')));
+                .meter(name( "events", routingKey.replace('.', '-')));
     }
 
     private Meter getErrorMeter(String errorType) {
-        return Application.metricRegistry.meter(name(HttpServer.class, "errors", errorType));
+        return Application.metricRegistry.meter(name( "errors", errorType));
     }
 
     private ArrayList<EventGroup> filterEventGroupsForApiKey(Validator validator,
